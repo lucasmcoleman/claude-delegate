@@ -1,15 +1,18 @@
 """Claude-delegate MCP server.
 
 Lets a Claude Code instance on one machine hand work off to Claude Code on
-this one.
+this one, with named conversations for multi-turn delegation.
 
 Tools:
-- submit(...)        -> {task_id, status}   start a job, returns immediately
+- submit(...)        -> {task_id, status, conversation_id?, session_id?}
+                                            start a job, returns immediately
 - poll(task_id, ...) -> {status, output, next_byte, done, ...}
-                                            check on a running/done job; long-polls
+                                            check on a running/done job
 - cancel(task_id)    -> {status}            kill a running job
 - list_tasks(limit)  -> [task summary, ...] recent jobs
-- delegate(...)      -> str                 fire-and-await convenience wrapper
+- list_conversations(limit) -> [conv, ...]  known conversations
+- forget_conversation(id) -> {ok}           drop a conversation mapping
+- delegate(...)      -> str                 fire-and-await convenience
 - info()             -> dict                hostname / config snapshot
 """
 
@@ -53,6 +56,9 @@ class Job:
     model: str | None
     timeout: int
     submitted_at: float
+    conversation_id: str | None = None
+    session_id: str | None = None
+    resume_existing: bool = False
     started_at: float | None = None
     completed_at: float | None = None
     status: str = "queued"
@@ -74,6 +80,8 @@ class Job:
             "prompt_preview": self.prompt[:120],
             "cwd": self.cwd,
             "model": self.model,
+            "conversation_id": self.conversation_id,
+            "session_id": self.session_id,
             "output_bytes": len(self.output),
             "error": self.error,
         }
@@ -96,15 +104,34 @@ CREATE TABLE IF NOT EXISTS tasks (
     status TEXT NOT NULL,
     return_code INTEGER,
     output BLOB,
-    error TEXT
+    error TEXT,
+    conversation_id TEXT,
+    session_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_submitted_at ON tasks(submitted_at DESC);
+
+CREATE TABLE IF NOT EXISTS conversations (
+    conversation_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    last_used_at REAL NOT NULL,
+    turns INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_conversations_last_used ON conversations(last_used_at DESC);
 """
 
 
 async def _db_init() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA)
+        # Idempotent migration for older tasks.db that pre-dated conversations.
+        async with db.execute("PRAGMA table_info(tasks)") as cur:
+            existing_cols = {row[1] async for row in cur}
+        if "conversation_id" not in existing_cols:
+            await db.execute("ALTER TABLE tasks ADD COLUMN conversation_id TEXT")
+        if "session_id" not in existing_cols:
+            await db.execute("ALTER TABLE tasks ADD COLUMN session_id TEXT")
         await db.commit()
 
 
@@ -115,13 +142,15 @@ async def _db_archive(job: Job) -> None:
             INSERT OR REPLACE INTO tasks
             (task_id, prompt, cwd, model, timeout_seconds,
              submitted_at, started_at, completed_at,
-             status, return_code, output, error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             status, return_code, output, error,
+             conversation_id, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job.task_id, job.prompt, job.cwd, job.model, job.timeout,
                 job.submitted_at, job.started_at, job.completed_at,
                 job.status, job.return_code, bytes(job.output), job.error,
+                job.conversation_id, job.session_id,
             ),
         )
         await db.commit()
@@ -148,11 +177,59 @@ async def _db_load(task_id: str) -> Job | None:
         status=row["status"],
         return_code=row["return_code"],
         error=row["error"],
+        conversation_id=row["conversation_id"],
+        session_id=row["session_id"],
     )
     if row["output"]:
         job.output.extend(row["output"])
     job.event.set()
     return job
+
+
+async def _db_get_conversation(conversation_id: str) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM conversations WHERE conversation_id = ?",
+            (conversation_id,),
+        ) as cur:
+            row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def _db_create_conversation(
+    conversation_id: str, session_id: str, cwd: str
+) -> None:
+    now = time.time()
+    async with _db_lock, aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO conversations "
+            "(conversation_id, session_id, cwd, created_at, last_used_at, turns) "
+            "VALUES (?, ?, ?, ?, ?, 0)",
+            (conversation_id, session_id, cwd, now, now),
+        )
+        await db.commit()
+
+
+async def _db_touch_conversation(conversation_id: str) -> None:
+    async with _db_lock, aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE conversations "
+            "SET last_used_at = ?, turns = turns + 1 "
+            "WHERE conversation_id = ?",
+            (time.time(), conversation_id),
+        )
+        await db.commit()
+
+
+async def _db_forget_conversation(conversation_id: str) -> bool:
+    async with _db_lock, aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM conversations WHERE conversation_id = ?",
+            (conversation_id,),
+        )
+        await db.commit()
+        return cur.rowcount > 0
 
 
 def _build_argv(job: Job) -> list[str]:
@@ -164,8 +241,20 @@ def _build_argv(job: Job) -> list[str]:
     ]
     if job.model:
         argv += ["--model", job.model]
+    if job.session_id:
+        if job.resume_existing:
+            argv += ["--resume", job.session_id]
+        else:
+            argv += ["--session-id", job.session_id]
     argv.append(job.prompt)
     return argv
+
+
+def _active_job_for_conversation(conversation_id: str) -> Job | None:
+    for j in JOBS.values():
+        if j.conversation_id == conversation_id and j.status in ACTIVE_STATES:
+            return j
+    return None
 
 
 async def _run_job(job: Job) -> None:
@@ -188,8 +277,10 @@ async def _run_job(job: Job) -> None:
 
         argv = _build_argv(job)
         log.info(
-            "job %s start: cwd=%s model=%s timeout=%ss",
+            "job %s start: cwd=%s model=%s timeout=%ss conv=%s session=%s%s",
             job.task_id, job.cwd, job.model or "<default>", job.timeout,
+            job.conversation_id or "-", job.session_id or "-",
+            " (resume)" if job.resume_existing else "",
         )
 
         try:
@@ -258,10 +349,74 @@ async def _run_job(job: Job) -> None:
             await _db_archive(job)
         except Exception:
             log.exception("failed to archive job %s", job.task_id)
+        if job.conversation_id and job.status == "completed":
+            try:
+                await _db_touch_conversation(job.conversation_id)
+            except Exception:
+                log.exception("failed to touch conversation %s", job.conversation_id)
         log.info(
             "job %s end: status=%s rc=%s bytes=%d",
             job.task_id, job.status, job.return_code, len(job.output),
         )
+
+
+async def _prepare_job(
+    prompt: str,
+    cwd: str | None,
+    timeout_seconds: int,
+    model: str | None,
+    conversation_id: str | None,
+) -> Job | dict:
+    """Build a Job ready to run, or return {"error": ...} if input is bad.
+
+    Resolves conversation_id to a session_id and pinned cwd, creating a new
+    conversation row on first use.
+    """
+    timeout = min(max(int(timeout_seconds), 10), MAX_TIMEOUT)
+    work_dir = cwd or DEFAULT_CWD
+    session_id: str | None = None
+    resume_existing = False
+
+    if conversation_id:
+        active = _active_job_for_conversation(conversation_id)
+        if active:
+            return {
+                "error": (
+                    f"conversation {conversation_id!r} already has an active "
+                    f"task ({active.task_id}); wait for it to finish, cancel "
+                    f"it, or use a different conversation_id"
+                )
+            }
+
+        conv = await _db_get_conversation(conversation_id)
+        if conv:
+            session_id = conv["session_id"]
+            pinned_cwd = conv["cwd"]
+            if cwd and str(Path(cwd).resolve()) != str(Path(pinned_cwd).resolve()):
+                return {
+                    "error": (
+                        f"conversation {conversation_id!r} is pinned to "
+                        f"cwd={pinned_cwd!r}; got cwd={cwd!r}. To switch "
+                        f"projects, use a new conversation_id."
+                    )
+                }
+            work_dir = pinned_cwd
+            resume_existing = True
+        else:
+            session_id = str(uuid.uuid4())
+            await _db_create_conversation(conversation_id, session_id, work_dir)
+
+    return Job(
+        task_id=str(uuid.uuid4()),
+        prompt=prompt,
+        cwd=work_dir,
+        model=model,
+        timeout=timeout,
+        submitted_at=time.time(),
+        conversation_id=conversation_id,
+        session_id=session_id,
+        resume_existing=resume_existing,
+    )
 
 
 verifier = StaticTokenVerifier(
@@ -273,9 +428,11 @@ mcp = FastMCP(
     name="claude-delegate",
     instructions=(
         "Hand a task to Claude Code on a different machine. "
-        "Prefer `submit` + `poll` for anything that might take >30s — that "
-        "way you can check in or move on without blocking. Use `delegate` "
-        "for quick one-shots. `cancel` aborts a running job."
+        "Prefer `submit` + `poll` for anything that might take >30s. "
+        "Pass a `conversation_id` (any short memorable string) to keep "
+        "multi-turn context across calls — the same conversation_id "
+        "resumes the remote Claude session each time. `cancel` aborts a "
+        "running job; `list_conversations` shows what's been established."
     ),
     auth=verifier,
 )
@@ -287,36 +444,43 @@ async def submit(
     cwd: str | None = None,
     timeout_seconds: int = 600,
     model: str | None = None,
+    conversation_id: str | None = None,
 ) -> dict:
     """Start a Claude Code job on this machine. Returns immediately.
 
     Args:
-        prompt: Task for the remote Claude. Be specific; it has no
-            conversation context from your session.
-        cwd: Working directory for the remote Claude (default: service
-            default). Use this to point at a specific project so Claude
-            picks up its CLAUDE.md / .git context.
+        prompt: Task for the remote Claude. Be specific; without a
+            conversation_id it has no memory of prior calls.
+        cwd: Working directory for the remote Claude. Required for the FIRST
+            call of a conversation; pinned and reused for later calls.
         timeout_seconds: Hard cap on the job's runtime. Capped server-side
             at DELEGATE_MAX_TIMEOUT.
         model: Optional model alias ('opus', 'sonnet', 'haiku') or full name.
+        conversation_id: Any short memorable string (e.g. 'auth-debug').
+            First call creates the conversation; later calls with the same
+            id resume the remote Claude session so it remembers everything
+            from prior turns. cwd is pinned at first use.
 
     Returns:
-        {"task_id": "...", "status": "queued"}. Use `poll(task_id)` to get
-        output and check completion.
+        {"task_id": "...", "status": "queued",
+         "conversation_id": "...", "session_id": "...", "resumed": <bool>}
+        Use `poll(task_id)` to get output and check completion.
     """
-    timeout = min(max(int(timeout_seconds), 10), MAX_TIMEOUT)
-    work_dir = cwd or DEFAULT_CWD
-    job = Job(
-        task_id=str(uuid.uuid4()),
-        prompt=prompt,
-        cwd=work_dir,
-        model=model,
-        timeout=timeout,
-        submitted_at=time.time(),
+    prepared = await _prepare_job(
+        prompt, cwd, timeout_seconds, model, conversation_id
     )
+    if isinstance(prepared, dict):
+        return prepared
+    job = prepared
     JOBS[job.task_id] = job
     asyncio.create_task(_run_job(job))
-    return {"task_id": job.task_id, "status": job.status}
+    return {
+        "task_id": job.task_id,
+        "status": job.status,
+        "conversation_id": job.conversation_id,
+        "session_id": job.session_id,
+        "resumed": job.resume_existing,
+    }
 
 
 @mcp.tool
@@ -327,16 +491,9 @@ async def poll(
 ) -> dict:
     """Check on a job. Returns new output since `since_byte` and current status.
 
-    Use `wait_seconds > 0` to long-poll: the call will block up to that many
-    seconds waiting for new output or completion before returning. This is
-    much more efficient than tight-polling.
-
-    Args:
-        task_id: The id returned by `submit`.
-        since_byte: Byte offset of last-seen output. Pass the `next_byte`
-            from your previous poll. Defaults to 0 (return everything so far).
-        wait_seconds: Max seconds to wait for new output / completion. 0
-            returns immediately. Capped at 60.
+    Use `wait_seconds > 0` to long-poll: the call blocks server-side up to
+    that many seconds (capped at 60) waiting for new output or completion
+    before returning. Much more efficient than tight-polling.
 
     Returns:
         {
@@ -389,11 +546,7 @@ async def poll(
 
 @mcp.tool
 async def cancel(task_id: str) -> dict:
-    """Kill a running job. No-op if the job is already terminal.
-
-    Returns:
-        {"status": "<current status>", "cancelled": <bool>}
-    """
+    """Kill a running job. No-op if the job is already terminal."""
     job = JOBS.get(task_id)
     if not job:
         job = await _db_load(task_id)
@@ -419,7 +572,7 @@ async def cancel(task_id: str) -> dict:
 
 @mcp.tool
 async def list_tasks(limit: int = 20, include_running: bool = True) -> list[dict]:
-    """Recent jobs, newest first. Pulls from the in-memory set and the SQLite archive."""
+    """Recent jobs, newest first. Pulls from the in-memory set and SQLite archive."""
     limit = max(1, min(limit, 200))
     seen: set[str] = set()
     rows: list[dict] = []
@@ -437,7 +590,8 @@ async def list_tasks(limit: int = 20, include_running: bool = True) -> list[dict
         async with db.execute(
             "SELECT task_id, prompt, cwd, model, status, "
             "submitted_at, started_at, completed_at, return_code, "
-            "LENGTH(output) AS output_bytes, error "
+            "LENGTH(output) AS output_bytes, error, "
+            "conversation_id, session_id "
             "FROM tasks ORDER BY submitted_at DESC LIMIT ?",
             (limit,),
         ) as cur:
@@ -454,6 +608,8 @@ async def list_tasks(limit: int = 20, include_running: bool = True) -> list[dict
                     "prompt_preview": (row["prompt"] or "")[:120],
                     "cwd": row["cwd"],
                     "model": row["model"],
+                    "conversation_id": row["conversation_id"],
+                    "session_id": row["session_id"],
                     "output_bytes": row["output_bytes"] or 0,
                     "error": row["error"],
                 })
@@ -464,31 +620,65 @@ async def list_tasks(limit: int = 20, include_running: bool = True) -> list[dict
 
 
 @mcp.tool
+async def list_conversations(limit: int = 20) -> list[dict]:
+    """Known conversations, most recently used first."""
+    limit = max(1, min(limit, 200))
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT conversation_id, session_id, cwd, "
+            "created_at, last_used_at, turns "
+            "FROM conversations ORDER BY last_used_at DESC LIMIT ?",
+            (limit,),
+        ) as cur:
+            return [dict(row) async for row in cur]
+
+
+@mcp.tool
+async def forget_conversation(conversation_id: str) -> dict:
+    """Drop a conversation mapping.
+
+    Note: this only removes the (conversation_id -> session_id) mapping from
+    the local DB. The underlying Claude session file on disk is left alone;
+    subsequent calls with the same conversation_id will create a brand-new
+    session.
+    """
+    if _active_job_for_conversation(conversation_id):
+        return {
+            "ok": False,
+            "error": f"conversation {conversation_id!r} has an active task; "
+                     f"cancel it first",
+        }
+    dropped = await _db_forget_conversation(conversation_id)
+    return {"ok": dropped, "forgotten": dropped}
+
+
+@mcp.tool
 async def delegate(
     prompt: str,
     cwd: str | None = None,
     timeout_seconds: int = 600,
     model: str | None = None,
+    conversation_id: str | None = None,
 ) -> str:
     """Fire-and-await convenience: submit a job and block until it finishes.
 
-    Equivalent to calling `submit` then `poll(wait_seconds=...)` until done.
-    Prefer `submit` + `poll` for long jobs — if your caller hangs up here,
-    the underlying claude subprocess is killed (the cancel bug is fixed).
+    Equivalent to `submit` + `poll(wait_seconds=...)` until done. Prefer
+    `submit` + `poll` for long jobs — but unlike before, if the caller
+    hangs up here, the underlying claude subprocess IS killed.
+
+    Pass `conversation_id` to keep multi-turn context across calls (see
+    `submit` for details).
 
     Returns:
         The job's stdout (or an error string prefixed with 'ERROR:').
     """
-    timeout = min(max(int(timeout_seconds), 10), MAX_TIMEOUT)
-    work_dir = cwd or DEFAULT_CWD
-    job = Job(
-        task_id=str(uuid.uuid4()),
-        prompt=prompt,
-        cwd=work_dir,
-        model=model,
-        timeout=timeout,
-        submitted_at=time.time(),
+    prepared = await _prepare_job(
+        prompt, cwd, timeout_seconds, model, conversation_id
     )
+    if isinstance(prepared, dict):
+        return f"ERROR: {prepared.get('error', 'submit failed')}"
+    job = prepared
     JOBS[job.task_id] = job
     runner = asyncio.create_task(_run_job(job))
 
@@ -499,7 +689,10 @@ async def delegate(
             out = bytes(job.output).decode(errors="replace").rstrip()
         if job.status == "completed":
             return out
-        return f"ERROR: status={job.status} rc={job.return_code} err={job.error}\n--- output ---\n{out}"
+        return (
+            f"ERROR: status={job.status} rc={job.return_code} "
+            f"err={job.error}\n--- output ---\n{out}"
+        )
     except asyncio.CancelledError:
         if not runner.done():
             if job.proc and job.proc.returncode is None:

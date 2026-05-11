@@ -20,14 +20,31 @@ machine A (Claude Code, your dev box)
 
 ## What it exposes
 
-Six MCP tools, in roughly increasing order of how often you'll reach for them:
+Eight MCP tools:
 
-- **`submit(prompt, cwd?, timeout_seconds?, model?) -> {task_id, status}`** — start a job. Returns immediately. **Use this for anything that might take >30s.** Pair with `poll`.
+- **`submit(prompt, cwd?, timeout_seconds?, model?, conversation_id?) -> {task_id, status, conversation_id, session_id, resumed}`** — start a job. Returns immediately. **Use this for anything that might take >30s.** Pair with `poll`.
 - **`poll(task_id, since_byte?, wait_seconds?) -> {status, output, next_byte, done, ...}`** — check on a job. Returns new output since `since_byte`. Set `wait_seconds > 0` for long-polling (efficient — the call blocks server-side until there's new output or the job ends, up to 60s).
 - **`cancel(task_id) -> {status, cancelled}`** — kill a running job.
 - **`list_tasks(limit?, include_running?) -> [task summary, ...]`** — recent jobs, newest first. Pulls from both the in-memory live set and the SQLite archive.
-- **`delegate(prompt, cwd?, timeout_seconds?, model?) -> str`** — fire-and-await convenience: equivalent to `submit` then block until done. If the caller hangs up, the underlying `claude` subprocess is killed.
+- **`list_conversations(limit?) -> [{conversation_id, session_id, cwd, turns, ...}]`** — known conversations, most recently used first.
+- **`forget_conversation(conversation_id) -> {ok, forgotten}`** — drop a conversation mapping. The underlying Claude session file on disk is left alone.
+- **`delegate(prompt, cwd?, timeout_seconds?, model?, conversation_id?) -> str`** — fire-and-await convenience: equivalent to `submit` then block until done. If the caller hangs up, the underlying `claude` subprocess is killed.
 - **`info() -> dict`** — hostname, user, claude binary, default cwd, max timeout, active job count, db path. Useful for confirming the connection.
+
+### Conversations (multi-turn delegation)
+
+Pass `conversation_id` (any short memorable string — `"auth-debug"`, `"frontend-refactor"`, whatever) to keep context across delegated calls. The first call creates a fresh Claude session pinned to that id; subsequent calls with the same id `--resume` the same session, so the remote Claude remembers earlier turns.
+
+```
+turn 1: delegate(prompt="please remember 8675309", conversation_id="demo")     -> "OK"
+turn 2: delegate(prompt="what number did I tell you?", conversation_id="demo") -> "8675309"
+```
+
+Constraints:
+
+- **`cwd` is pinned at first call.** Claude Code sessions live under a cwd-derived project dir on disk, so switching cwd mid-conversation would lose all context. Use a new `conversation_id` to switch projects.
+- **One active job per conversation.** Submitting a second job to a conversation with one still running returns an error — sessions can't be written concurrently.
+- **`forget_conversation` only drops the mapping**, not the underlying session file. If you call `submit` with the same `conversation_id` afterwards, you get a fresh session.
 
 ### When to use which
 
@@ -36,17 +53,20 @@ Six MCP tools, in roughly increasing order of how often you'll reach for them:
 | Quickly ask the other Claude something | `delegate` |
 | Kick off a long task and check back later | `submit` → `poll` |
 | Stream output as the remote Claude works | `submit` → `poll(wait_seconds=30)` in a loop |
+| Carry multi-turn context across calls | pass `conversation_id` to `submit` / `delegate` |
 | See what's currently running | `list_tasks` or `info` |
+| See what conversations exist | `list_conversations` |
 | Stop a hung job | `cancel` |
 
 ## Task state
 
-Live job state is in memory. On terminal status (completed / failed / cancelled / timeout) the job is archived to `tasks.db` (SQLite, configurable via `DELEGATE_DB`). `poll` and `cancel` will load by task id from the archive if the service has been restarted since the job ran.
+Live job state is in memory. On terminal status (completed / failed / cancelled / timeout) the job is archived to `tasks.db` (SQLite, configurable via `DELEGATE_DB`). `poll` and `cancel` will load by task id from the archive if the service has been restarted since the job ran. Conversation mappings (id → session uuid + cwd) live in the same DB and survive restarts.
 
 Inspect history directly with sqlite3:
 
 ```bash
-sqlite3 tasks.db 'SELECT task_id, status, return_code, length(output), substr(prompt,1,60) FROM tasks ORDER BY submitted_at DESC LIMIT 20'
+sqlite3 tasks.db 'SELECT task_id, status, return_code, length(output), conversation_id, substr(prompt,1,60) FROM tasks ORDER BY submitted_at DESC LIMIT 20'
+sqlite3 tasks.db 'SELECT conversation_id, session_id, cwd, turns, datetime(last_used_at,"unixepoch") FROM conversations ORDER BY last_used_at DESC'
 ```
 
 ## Requirements
