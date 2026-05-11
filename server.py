@@ -19,6 +19,7 @@ Tools:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -237,7 +238,9 @@ def _build_argv(job: Job) -> list[str]:
         CLAUDE_BIN,
         "-p",
         "--permission-mode", "bypassPermissions",
-        "--output-format", "text",
+        "--output-format", "stream-json",
+        "--include-partial-messages",
+        "--verbose",
     ]
     if job.model:
         argv += ["--model", job.model]
@@ -248,6 +251,43 @@ def _build_argv(job: Job) -> list[str]:
             argv += ["--session-id", job.session_id]
     argv.append(job.prompt)
     return argv
+
+
+def _format_event(event: dict) -> str:
+    """Convert one stream-json event to human-readable text for the output buffer.
+
+    We surface:
+    - assistant text deltas (the live stream of what claude is saying)
+    - tool_use starts ([tool: Bash], etc.) as signposts
+    - turn boundaries (blank line between agent turns)
+    - terminal errors
+
+    We drop hook spam, init banners, message envelopes, rate-limit pings, and
+    the redundant `result.result` (which duplicates the streamed text).
+    """
+    etype = event.get("type")
+
+    if etype == "stream_event":
+        inner = event.get("event") or {}
+        itype = inner.get("type")
+        if itype == "content_block_delta":
+            delta = inner.get("delta") or {}
+            if delta.get("type") == "text_delta":
+                return delta.get("text", "")
+        elif itype == "content_block_start":
+            block = inner.get("content_block") or {}
+            if block.get("type") == "tool_use":
+                name = block.get("name", "?")
+                return f"\n[tool: {name}]\n"
+        elif itype == "message_stop":
+            return "\n"
+        return ""
+
+    if etype == "result" and event.get("is_error"):
+        msg = event.get("result") or event.get("error") or "unknown error"
+        return f"\n[error: {msg}]\n"
+
+    return ""
 
 
 def _active_job_for_conversation(conversation_id: str) -> Job | None:
@@ -297,12 +337,30 @@ async def _run_job(job: Job) -> None:
 
         async def reader() -> None:
             assert job.proc and job.proc.stdout
+            stdout = job.proc.stdout
+            # claude emits JSON Lines; some can be very large (hook events with
+            # full skill text embedded), so raise the line limit well above the
+            # asyncio default (~64 KiB).
+            stdout._limit = max(getattr(stdout, "_limit", 0), 4 * 1024 * 1024)
             while True:
-                chunk = await job.proc.stdout.read(4096)
-                if not chunk:
+                try:
+                    line = await stdout.readline()
+                except asyncio.LimitOverrunError:
+                    # Skip the offending oversized line so we don't deadlock.
+                    log.warning("job %s: dropped oversized JSON line", job.task_id)
+                    continue
+                if not line:
                     return
+                try:
+                    event = json.loads(line)
+                    text = _format_event(event)
+                except json.JSONDecodeError:
+                    # Unexpected non-JSON output (e.g. a crash). Surface it raw.
+                    text = line.decode(errors="replace")
+                if not text:
+                    continue
                 async with job.lock:
-                    job.output.extend(chunk)
+                    job.output.extend(text.encode())
                 notify.set(); notify.clear()
 
         reader_task = asyncio.create_task(reader())

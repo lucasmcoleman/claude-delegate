@@ -58,6 +58,12 @@ Constraints:
 | See what conversations exist | `list_conversations` |
 | Stop a hung job | `cancel` |
 
+## Streaming output
+
+Jobs run with `claude -p --output-format stream-json --include-partial-messages`. The server parses each JSONL event and writes a readable transcript into the job's output buffer as Claude works — assistant text streams in as it's generated, with `[tool: Bash]` (etc.) signposts marking each tool call. `poll(wait_seconds=...)` returns new chunks as they arrive instead of waiting until the whole run is done.
+
+Hook events, init banners, message envelopes, rate-limit pings, and the redundant `result.result` payload are dropped from the visible output. Use `journalctl -u claude-delegate` if you need to see raw events for debugging.
+
 ## Task state
 
 Live job state is in memory. On terminal status (completed / failed / cancelled / timeout) the job is archived to `tasks.db` (SQLite, configurable via `DELEGATE_DB`). `poll` and `cancel` will load by task id from the archive if the service has been restarted since the job ran. Conversation mappings (id → session uuid + cwd) live in the same DB and survive restarts.
