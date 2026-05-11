@@ -20,10 +20,34 @@ machine A (Claude Code, your dev box)
 
 ## What it exposes
 
-Two MCP tools:
+Six MCP tools, in roughly increasing order of how often you'll reach for them:
 
-- **`delegate(prompt, cwd?, timeout_seconds?, model?) -> str`** — runs `claude -p <prompt>` on the host, returns whatever it printed. `cwd` lets the remote Claude pick up that project's `CLAUDE.md` and git context. `model` is optional (`opus`/`sonnet`/`haiku` alias or full name).
-- **`info() -> dict`** — hostname, user, claude binary path, default cwd, max timeout. Useful for confirming the connection.
+- **`submit(prompt, cwd?, timeout_seconds?, model?) -> {task_id, status}`** — start a job. Returns immediately. **Use this for anything that might take >30s.** Pair with `poll`.
+- **`poll(task_id, since_byte?, wait_seconds?) -> {status, output, next_byte, done, ...}`** — check on a job. Returns new output since `since_byte`. Set `wait_seconds > 0` for long-polling (efficient — the call blocks server-side until there's new output or the job ends, up to 60s).
+- **`cancel(task_id) -> {status, cancelled}`** — kill a running job.
+- **`list_tasks(limit?, include_running?) -> [task summary, ...]`** — recent jobs, newest first. Pulls from both the in-memory live set and the SQLite archive.
+- **`delegate(prompt, cwd?, timeout_seconds?, model?) -> str`** — fire-and-await convenience: equivalent to `submit` then block until done. If the caller hangs up, the underlying `claude` subprocess is killed.
+- **`info() -> dict`** — hostname, user, claude binary, default cwd, max timeout, active job count, db path. Useful for confirming the connection.
+
+### When to use which
+
+| You want to... | Tool |
+|---|---|
+| Quickly ask the other Claude something | `delegate` |
+| Kick off a long task and check back later | `submit` → `poll` |
+| Stream output as the remote Claude works | `submit` → `poll(wait_seconds=30)` in a loop |
+| See what's currently running | `list_tasks` or `info` |
+| Stop a hung job | `cancel` |
+
+## Task state
+
+Live job state is in memory. On terminal status (completed / failed / cancelled / timeout) the job is archived to `tasks.db` (SQLite, configurable via `DELEGATE_DB`). `poll` and `cancel` will load by task id from the archive if the service has been restarted since the job ran.
+
+Inspect history directly with sqlite3:
+
+```bash
+sqlite3 tasks.db 'SELECT task_id, status, return_code, length(output), substr(prompt,1,60) FROM tasks ORDER BY submitted_at DESC LIMIT 20'
+```
 
 ## Requirements
 
