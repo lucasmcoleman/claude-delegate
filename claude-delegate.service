@@ -1,0 +1,26 @@
+[Unit]
+Description=Claude Code delegation MCP server (LAN-accessible)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as your own user so `claude` has access to your credentials and projects.
+User=lucas
+Group=lucas
+WorkingDirectory=/opt/claude-delegate
+EnvironmentFile=/opt/claude-delegate/.env
+ExecStart=/opt/claude-delegate/.venv/bin/python /opt/claude-delegate/server.py
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+# Light hardening; this needs broad access to invoke claude on user files
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target
